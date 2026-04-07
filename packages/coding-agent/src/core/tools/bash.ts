@@ -10,7 +10,7 @@ import { keyHint } from "../../modes/interactive/components/keybinding-hints.js"
 import { truncateToVisualLines } from "../../modes/interactive/components/visual-truncate.js";
 import { theme } from "../../modes/interactive/theme/theme.js";
 import { waitForChildProcess } from "../../utils/child-process.js";
-import { getShellConfig, getShellEnv, killProcessTree } from "../../utils/shell.js";
+import { buildShellCommandArgs, getShellConfig, getShellEnv, killProcessTree } from "../../utils/shell.js";
 import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.js";
 import { getTextOutput, invalidArgText, str } from "./render-utils.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
@@ -25,7 +25,7 @@ function getTempFilePath(): string {
 }
 
 const bashSchema = Type.Object({
-	command: Type.String({ description: "Bash command to execute" }),
+	command: Type.String({ description: "Shell command to execute" }),
 	timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (optional, no default timeout)" })),
 });
 
@@ -70,14 +70,17 @@ export function createLocalBashOperations(): BashOperations {
 	return {
 		exec: (command, cwd, { onData, signal, timeout, env }) => {
 			return new Promise((resolve, reject) => {
-				const { shell, args } = getShellConfig();
+				const shellConfig = getShellConfig();
+				const detached = process.platform !== "win32" || shellConfig.family !== "powershell";
 				if (!existsSync(cwd)) {
-					reject(new Error(`Working directory does not exist: ${cwd}\nCannot execute bash commands.`));
+					reject(new Error(`Working directory does not exist: ${cwd}\nCannot execute shell commands.`));
 					return;
 				}
-				const child = spawn(shell, [...args, command], {
+				const child = spawn(shellConfig.shell, buildShellCommandArgs(shellConfig, command), {
 					cwd,
-					detached: true,
+					// On Windows, PowerShell drops piped stdout/stderr when spawned detached.
+					// Keep it attached so interactive `!` commands can still stream output.
+					detached,
 					env: env ?? getShellEnv(),
 					stdio: ["ignore", "pipe", "pipe"],
 				});
@@ -147,6 +150,28 @@ export interface BashToolOptions {
 	commandPrefix?: string;
 	/** Hook to adjust command, cwd, or env before execution */
 	spawnHook?: BashSpawnHook;
+}
+
+function getShellAwareToolText(): {
+	descriptionShellText: string;
+	promptSnippet: string;
+} {
+	try {
+		const shellConfig = getShellConfig();
+		if (shellConfig.family === "powershell") {
+			return {
+				descriptionShellText: "configured PowerShell shell",
+				promptSnippet: "Execute PowerShell commands (Get-ChildItem, Select-String, rg, etc.)",
+			};
+		}
+	} catch {
+		// Fall back to generic shell wording when the configured shell cannot be resolved yet.
+	}
+
+	return {
+		descriptionShellText: "configured shell",
+		promptSnippet: "Execute shell commands (ls, grep, find, etc.)",
+	};
 }
 
 const BASH_PREVIEW_LINES = 5;
@@ -266,11 +291,12 @@ export function createBashToolDefinition(
 	const ops = options?.operations ?? createLocalBashOperations();
 	const commandPrefix = options?.commandPrefix;
 	const spawnHook = options?.spawnHook;
+	const toolText = getShellAwareToolText();
 	return {
 		name: "bash",
 		label: "bash",
-		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.`,
-		promptSnippet: "Execute bash commands (ls, grep, find, etc.)",
+		description: `Execute a command in the current working directory using the ${toolText.descriptionShellText}. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.`,
+		promptSnippet: toolText.promptSnippet,
 		parameters: bashSchema,
 		async execute(
 			_toolCallId,

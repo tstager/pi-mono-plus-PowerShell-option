@@ -4,7 +4,7 @@
  */
 
 import { execSync, spawnSync } from "child_process";
-import { getShellConfig } from "../utils/shell.js";
+import { buildShellCommandArgs, getShellConfig } from "../utils/shell.js";
 
 // Cache for shell command results (persists for process lifetime)
 const commandResultCache = new Map<string, string | undefined>();
@@ -24,8 +24,8 @@ export function resolveConfigValue(config: string): string | undefined {
 
 function executeWithConfiguredShell(command: string): { executed: boolean; value: string | undefined } {
 	try {
-		const { shell, args } = getShellConfig();
-		const result = spawnSync(shell, [...args, command], {
+		const shellConfig = getShellConfig();
+		const result = spawnSync(shellConfig.shell, buildShellCommandArgs(shellConfig, command), {
 			encoding: "utf-8",
 			timeout: 10000,
 			stdio: ["ignore", "pipe", "ignore"],

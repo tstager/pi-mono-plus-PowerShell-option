@@ -70,6 +70,17 @@ describe("buildSystemPrompt", () => {
 	});
 
 	describe("prompt guidelines", () => {
+		test("refers to the bash tool rather than bash-only shell semantics", () => {
+			const prompt = buildSystemPrompt({
+				selectedTools: ["bash"],
+				contextFiles: [],
+				skills: [],
+			});
+
+			expect(prompt).toContain("- Use the bash tool for shell file operations like ls, rg, find");
+			expect(prompt).not.toContain("- Use bash for file operations like ls, rg, find");
+		});
+
 		test("appends promptGuidelines to default guidelines", () => {
 			const prompt = buildSystemPrompt({
 				selectedTools: ["read", "dynamic_tool"],
@@ -90,6 +101,19 @@ describe("buildSystemPrompt", () => {
 			});
 
 			expect(prompt.match(/- Use dynamic_tool for summaries\./g)).toHaveLength(1);
+		});
+
+		test("refers to the bash tool when specialized file tools are available", () => {
+			const prompt = buildSystemPrompt({
+				selectedTools: ["bash", "grep"],
+				contextFiles: [],
+				skills: [],
+			});
+
+			expect(prompt).toContain(
+				"- Prefer grep/find/ls tools over the bash tool for file exploration (faster, respects .gitignore)",
+			);
+			expect(prompt).not.toContain("- Prefer grep/find/ls tools over bash for file exploration");
 		});
 	});
 });

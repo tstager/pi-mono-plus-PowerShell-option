@@ -4,7 +4,45 @@ import { spawn, spawnSync } from "child_process";
 import { getBinDir, getSettingsPath } from "../config.js";
 import { SettingsManager } from "../core/settings-manager.js";
 
-let cachedShellConfig: { shell: string; args: string[] } | null = null;
+export type ShellFamily = "bash" | "powershell";
+
+export interface ShellConfig {
+	shell: string;
+	family: ShellFamily;
+	args: string[];
+}
+
+let cachedShellConfig: ShellConfig | null = null;
+
+function getShellArgs(family: ShellFamily): string[] {
+	if (family === "powershell") {
+		return ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"];
+	}
+
+	return ["-c"];
+}
+
+export function detectShellFamily(shellPath: string): ShellFamily {
+	const executableName = shellPath
+		.split(/[\\/]/)
+		.at(-1)
+		?.replace(/\.(exe|cmd|bat)$/i, "")
+		.toLowerCase();
+	return executableName === "pwsh" || executableName === "powershell" ? "powershell" : "bash";
+}
+
+export function createShellConfig(shell: string): ShellConfig {
+	const family = detectShellFamily(shell);
+	return {
+		shell,
+		family,
+		args: getShellArgs(family),
+	};
+}
+
+export function buildShellCommandArgs(config: Pick<ShellConfig, "args">, command: string): string[] {
+	return [...config.args, command];
+}
 
 /**
  * Find bash executable on PATH (cross-platform)
@@ -48,7 +86,7 @@ function findBashOnPath(): string | null {
  * 2. On Windows: Git Bash in known locations, then bash on PATH
  * 3. On Unix: /bin/bash, then bash on PATH, then fallback to sh
  */
-export function getShellConfig(): { shell: string; args: string[] } {
+export function getShellConfig(): ShellConfig {
 	if (cachedShellConfig) {
 		return cachedShellConfig;
 	}
@@ -59,7 +97,7 @@ export function getShellConfig(): { shell: string; args: string[] } {
 	// 1. Check user-specified shell path
 	if (customShellPath) {
 		if (existsSync(customShellPath)) {
-			cachedShellConfig = { shell: customShellPath, args: ["-c"] };
+			cachedShellConfig = createShellConfig(customShellPath);
 			return cachedShellConfig;
 		}
 		throw new Error(
@@ -81,7 +119,7 @@ export function getShellConfig(): { shell: string; args: string[] } {
 
 		for (const path of paths) {
 			if (existsSync(path)) {
-				cachedShellConfig = { shell: path, args: ["-c"] };
+				cachedShellConfig = createShellConfig(path);
 				return cachedShellConfig;
 			}
 		}
@@ -89,7 +127,7 @@ export function getShellConfig(): { shell: string; args: string[] } {
 		// 3. Fallback: search bash.exe on PATH (Cygwin, MSYS2, WSL, etc.)
 		const bashOnPath = findBashOnPath();
 		if (bashOnPath) {
-			cachedShellConfig = { shell: bashOnPath, args: ["-c"] };
+			cachedShellConfig = createShellConfig(bashOnPath);
 			return cachedShellConfig;
 		}
 
@@ -104,17 +142,17 @@ export function getShellConfig(): { shell: string; args: string[] } {
 
 	// Unix: try /bin/bash, then bash on PATH, then fallback to sh
 	if (existsSync("/bin/bash")) {
-		cachedShellConfig = { shell: "/bin/bash", args: ["-c"] };
+		cachedShellConfig = createShellConfig("/bin/bash");
 		return cachedShellConfig;
 	}
 
 	const bashOnPath = findBashOnPath();
 	if (bashOnPath) {
-		cachedShellConfig = { shell: bashOnPath, args: ["-c"] };
+		cachedShellConfig = createShellConfig(bashOnPath);
 		return cachedShellConfig;
 	}
 
-	cachedShellConfig = { shell: "sh", args: ["-c"] };
+	cachedShellConfig = createShellConfig("sh");
 	return cachedShellConfig;
 }
 

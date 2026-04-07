@@ -115,9 +115,18 @@ When a provider requests a retry delay longer than `maxDelayMs` (e.g., Google's 
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `shellPath` | string | - | Custom shell path (e.g., for Cygwin on Windows) |
-| `shellCommandPrefix` | string | - | Prefix for every bash command (e.g., `"shopt -s expand_aliases"`) |
+| `shellPath` | string | - | Custom shell executable path for the `bash` tool (for example bash, `pwsh`, or `powershell`) |
+| `shellCommandPrefix` | string | - | Prefix prepended to every `bash`-tool command (for example `"shopt -s expand_aliases"` or `"Set-StrictMode -Version Latest"`) |
 | `npmCommand` | string[] | - | Command argv used for npm package lookup/install operations (e.g., `["mise", "exec", "node@20", "--", "npm"]`) |
+
+Pi keeps the public tool name `bash` for compatibility, but executes commands through the configured shell backend. On Windows, Pi looks for Git Bash in the standard install locations or another `bash.exe` on PATH by default; set `shellPath` to `pwsh.exe` or `powershell.exe` if you want the `bash` tool to run PowerShell commands instead.
+
+```json
+{
+  "shellPath": "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+  "shellCommandPrefix": "Set-StrictMode -Version Latest"
+}
+```
 
 ```json
 {
