@@ -16,17 +16,32 @@ import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import type { Message } from "@mariozechner/pi-ai";
 import { StringEnum } from "@mariozechner/pi-ai";
 import { type ExtensionAPI, getMarkdownTheme, withFileMutationQueue } from "@mariozechner/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.js";
+import { type AgentConfig, type AgentScope, type AgentSource, discoverAgents } from "./agents.js";
+import {
+	type AgentAuthoringScope,
+	buildDefaultSystemPrompt,
+	DEFAULT_AGENT_TOOLS,
+	normalizeAgentName,
+	normalizeAgentTools,
+	resolveAgentFilePath,
+	writeAgentDefinition,
+} from "./authoring.js";
+import {
+	MAX_CONCURRENCY_LIMIT,
+	MAX_PARALLEL_TASKS_LIMIT,
+	resolveExecutionLimits,
+	type SubagentExecutionLimits,
+} from "./config.js";
 
-const MAX_PARALLEL_TASKS = 8;
-const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
+const bundledAgentsDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "agents");
 
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -141,7 +156,7 @@ interface UsageStats {
 
 interface SingleResult {
 	agent: string;
-	agentSource: "user" | "project" | "unknown";
+	agentSource: AgentSource | "unknown";
 	task: string;
 	exitCode: number;
 	messages: Message[];
@@ -157,7 +172,44 @@ interface SubagentDetails {
 	mode: "single" | "parallel" | "chain";
 	agentScope: AgentScope;
 	projectAgentsDir: string | null;
+	bundledAgentsDir: string | null;
+	executionLimits: SubagentExecutionLimits;
 	results: SingleResult[];
+}
+
+const AgentAuthoringScopeSchema = StringEnum(["project", "user"] as const, {
+	description:
+		'Where to save the agent definition. "project" writes to .pi/agents and "user" writes to ~/.pi/agent/agents.',
+	default: "project",
+});
+
+const CreateSubagentAgentParams = Type.Object({
+	name: Type.String({ description: "Lowercase agent name. Letters, numbers, and hyphens only." }),
+	description: Type.String({ description: "When to use this custom agent." }),
+	scope: Type.Optional(AgentAuthoringScopeSchema),
+	tools: Type.Optional(
+		Type.Array(Type.String({ description: "Tool name allowed for this agent." }), {
+			description: "Optional list of tool names to expose to the agent.",
+		}),
+	),
+	model: Type.Optional(Type.String({ description: "Optional model override for the custom agent." })),
+	systemPrompt: Type.Optional(
+		Type.String({ description: "Optional custom system prompt body for the agent markdown file." }),
+	),
+	overwrite: Type.Optional(
+		Type.Boolean({ description: "Overwrite an existing agent file with the same name.", default: false }),
+	),
+});
+
+function parseCommandSeed(args: string): { name?: string; description?: string } {
+	const trimmed = args.trim();
+	if (!trimmed) return {};
+
+	const [name, ...descriptionParts] = trimmed.split(/\s+/);
+	return {
+		name,
+		description: descriptionParts.length > 0 ? descriptionParts.join(" ") : undefined,
+	};
 }
 
 function getFinalOutput(messages: Message[]): string {
@@ -421,6 +473,20 @@ const SubagentParams = Type.Object({
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task} for parallel execution" })),
 	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of {agent, task} for sequential execution" })),
 	agentScope: Type.Optional(AgentScopeSchema),
+	maxParallelTasks: Type.Optional(
+		Type.Integer({
+			minimum: 1,
+			maximum: MAX_PARALLEL_TASKS_LIMIT,
+			description: `Optional upper bound for fan-out. Defaults can also be set with PI_SUBAGENT_MAX_PARALLEL_TASKS.`,
+		}),
+	),
+	maxConcurrency: Type.Optional(
+		Type.Integer({
+			minimum: 1,
+			maximum: MAX_CONCURRENCY_LIMIT,
+			description: `Optional worker concurrency for parallel mode. Defaults can also be set with PI_SUBAGENT_MAX_CONCURRENCY.`,
+		}),
+	),
 	confirmProjectAgents: Type.Optional(
 		Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true }),
 	),
@@ -434,6 +500,8 @@ export default function (pi: ExtensionAPI) {
 		description: [
 			"Delegate tasks to specialized subagents with isolated context.",
 			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
+			"Bundled agents ship with the extension, and user/project agents are discovered dynamically.",
+			"Parallel mode supports higher configurable fan-out through maxParallelTasks and maxConcurrency.",
 			'Default agent scope is "user" (from ~/.pi/agent/agents).',
 			'To enable project-local agents in .pi/agents, set agentScope: "both" (or "project").',
 		].join(" "),
@@ -441,7 +509,11 @@ export default function (pi: ExtensionAPI) {
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const agentScope: AgentScope = params.agentScope ?? "user";
-			const discovery = discoverAgents(ctx.cwd, agentScope);
+			const executionLimits = resolveExecutionLimits({
+				maxParallelTasks: params.maxParallelTasks,
+				maxConcurrency: params.maxConcurrency,
+			});
+			const discovery = discoverAgents(ctx.cwd, agentScope, { bundledAgentsDir });
 			const agents = discovery.agents;
 			const confirmProjectAgents = params.confirmProjectAgents ?? true;
 
@@ -456,6 +528,8 @@ export default function (pi: ExtensionAPI) {
 					mode,
 					agentScope,
 					projectAgentsDir: discovery.projectAgentsDir,
+					bundledAgentsDir: discovery.bundledAgentsDir,
+					executionLimits,
 					results,
 				});
 
@@ -553,12 +627,12 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (params.tasks && params.tasks.length > 0) {
-				if (params.tasks.length > MAX_PARALLEL_TASKS)
+				if (params.tasks.length > executionLimits.maxParallelTasks)
 					return {
 						content: [
 							{
 								type: "text",
-								text: `Too many parallel tasks (${params.tasks.length}). Max is ${MAX_PARALLEL_TASKS}.`,
+								text: `Too many parallel tasks (${params.tasks.length}). Max is ${executionLimits.maxParallelTasks}.`,
 							},
 						],
 						details: makeDetails("parallel")([]),
@@ -593,28 +667,32 @@ export default function (pi: ExtensionAPI) {
 					}
 				};
 
-				const results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t, index) => {
-					const result = await runSingleAgent(
-						ctx.cwd,
-						agents,
-						t.agent,
-						t.task,
-						t.cwd,
-						undefined,
-						signal,
-						// Per-task update callback
-						(partial) => {
-							if (partial.details?.results[0]) {
-								allResults[index] = partial.details.results[0];
-								emitParallelUpdate();
-							}
-						},
-						makeDetails("parallel"),
-					);
-					allResults[index] = result;
-					emitParallelUpdate();
-					return result;
-				});
+				const results = await mapWithConcurrencyLimit(
+					params.tasks,
+					executionLimits.maxConcurrency,
+					async (t, index) => {
+						const result = await runSingleAgent(
+							ctx.cwd,
+							agents,
+							t.agent,
+							t.task,
+							t.cwd,
+							undefined,
+							signal,
+							// Per-task update callback
+							(partial) => {
+								if (partial.details?.results[0]) {
+									allResults[index] = partial.details.results[0];
+									emitParallelUpdate();
+								}
+							},
+							makeDetails("parallel"),
+						);
+						allResults[index] = result;
+						emitParallelUpdate();
+						return result;
+					},
+				);
 
 				const successCount = results.filter((r) => r.exitCode === 0).length;
 				const summaries = results.map((r) => {
@@ -626,7 +704,9 @@ export default function (pi: ExtensionAPI) {
 					content: [
 						{
 							type: "text",
-							text: `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n")}`,
+							text:
+								`Parallel: ${successCount}/${results.length} succeeded ` +
+								`(limit ${executionLimits.maxConcurrency}/${executionLimits.maxParallelTasks})\n\n${summaries.join("\n\n")}`,
 						},
 					],
 					details: makeDetails("parallel")(results),
@@ -981,6 +1061,167 @@ export default function (pi: ExtensionAPI) {
 
 			const text = result.content[0];
 			return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: "subagent_create_agent",
+		label: "Subagent Create Agent",
+		description:
+			"Create or overwrite a reusable custom subagent definition file in .pi/agents or ~/.pi/agent/agents. Use this to author new specialists for future subagent runs.",
+		parameters: CreateSubagentAgentParams,
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const scope: AgentAuthoringScope = params.scope ?? "project";
+			const name = normalizeAgentName(params.name);
+
+			if (!name) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: "Invalid agent name. Use lowercase letters, numbers, and single hyphens only.",
+						},
+					],
+					details: {
+						filePath: "",
+						scope,
+						content: "",
+					},
+					isError: true,
+				};
+			}
+
+			try {
+				const result = await writeAgentDefinition({
+					cwd: ctx.cwd,
+					name,
+					description: params.description,
+					scope,
+					tools: params.tools,
+					model: params.model,
+					systemPrompt: params.systemPrompt,
+					overwrite: params.overwrite ?? false,
+				});
+
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Created ${scope} agent "${name}" at ${result.filePath}.`,
+						},
+					],
+					details: result,
+				};
+			} catch (error) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: error instanceof Error ? error.message : String(error),
+						},
+					],
+					details: {
+						filePath: "",
+						scope,
+						content: "",
+					},
+					isError: true,
+				};
+			}
+		},
+	});
+
+	pi.registerCommand("subagent-agent", {
+		description: "Create or update a reusable subagent definition",
+		handler: async (args, ctx) => {
+			const seed = parseCommandSeed(args);
+			const rawName = await ctx.ui.input("Agent name", seed.name ?? "my-agent");
+			if (rawName === undefined) {
+				ctx.ui.notify("Agent creation cancelled.", "info");
+				return;
+			}
+
+			const name = normalizeAgentName(rawName);
+			if (!name) {
+				ctx.ui.notify("Agent names must use lowercase letters, numbers, and single hyphens.", "error");
+				return;
+			}
+
+			const description = await ctx.ui.input(
+				"Description",
+				seed.description ?? "Describe when this agent should be used.",
+			);
+			if (!description?.trim()) {
+				ctx.ui.notify("Agent creation cancelled: description is required.", "info");
+				return;
+			}
+
+			const scopeChoice = await ctx.ui.select("Save agent where?", [
+				"Project (.pi/agents)",
+				"User (~/.pi/agent/agents)",
+			]);
+			if (!scopeChoice) {
+				ctx.ui.notify("Agent creation cancelled.", "info");
+				return;
+			}
+			const scope: AgentAuthoringScope = scopeChoice.startsWith("Project") ? "project" : "user";
+
+			const toolsInput = await ctx.ui.input(
+				"Allowed tools (comma-separated, optional)",
+				DEFAULT_AGENT_TOOLS.join(", "),
+			);
+			if (toolsInput === undefined) {
+				ctx.ui.notify("Agent creation cancelled.", "info");
+				return;
+			}
+			const tools = normalizeAgentTools(toolsInput.trim() ? toolsInput : DEFAULT_AGENT_TOOLS);
+
+			const modelInput = await ctx.ui.input("Model override (optional)", "claude-sonnet-4-5");
+			if (modelInput === undefined) {
+				ctx.ui.notify("Agent creation cancelled.", "info");
+				return;
+			}
+			const model = modelInput.trim() || undefined;
+
+			const promptPrefill = buildDefaultSystemPrompt(name, description.trim());
+			const systemPrompt = await ctx.ui.editor("Agent system prompt", promptPrefill);
+			if (systemPrompt === undefined) {
+				ctx.ui.notify("Agent creation cancelled.", "info");
+				return;
+			}
+
+			const filePath = resolveAgentFilePath({
+				cwd: ctx.cwd,
+				name,
+				scope,
+			});
+			let overwrite = false;
+			if (fs.existsSync(filePath)) {
+				overwrite = await ctx.ui.confirm(
+					"Overwrite existing agent?",
+					`${filePath}\n\nReplace the existing agent definition with the new content?`,
+				);
+				if (!overwrite) {
+					ctx.ui.notify("Agent creation cancelled.", "info");
+					return;
+				}
+			}
+
+			try {
+				const result = await writeAgentDefinition({
+					cwd: ctx.cwd,
+					name,
+					description,
+					scope,
+					tools,
+					model,
+					systemPrompt,
+					overwrite,
+				});
+				ctx.ui.notify(`Saved ${scope} agent at ${result.filePath}`, "info");
+			} catch (error) {
+				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+			}
 		},
 	});
 }

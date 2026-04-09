@@ -1,0 +1,20 @@
+{
+	"name": "pi-subagent-extension",
+	"version": "0.66.0",
+	"description": "Reusable multi-subagent extension package for pi with bundled agents, skills, and agent authoring flows.",
+	"type": "module",
+	"keywords": ["pi-package", "pi-extension", "subagent", "multi-agent"],
+	"license": "MIT",
+	"pi": {
+		"extensions": ["./index.ts"],
+		"skills": ["./skills"],
+		"prompts": ["./prompts"]
+	},
+	"peerDependencies": {
+		"@mariozechner/pi-agent-core": "*",
+		"@mariozechner/pi-ai": "*",
+		"@mariozechner/pi-coding-agent": "*",
+		"@mariozechner/pi-tui": "*",
+		"@sinclair/typebox": "*"
+	}
+}
