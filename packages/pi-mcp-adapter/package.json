@@ -1,0 +1,27 @@
+{
+	"name": "pi-mcp-adapter",
+	"version": "0.1.0",
+	"description": "Installable pi package that connects pi to external MCP servers and exposes their tools.",
+	"type": "module",
+	"license": "MIT",
+	"keywords": ["pi-package", "pi-extension", "mcp", "model-context-protocol"],
+	"files": ["src", "skills", "README.md"],
+	"scripts": {
+		"clean": "echo \"nothing to clean\"",
+		"build": "echo \"nothing to build\"",
+		"check": "echo \"nothing to check\""
+	},
+	"pi": {
+		"extensions": ["./src/index.ts"],
+		"skills": ["./skills"]
+	},
+	"dependencies": {
+		"@modelcontextprotocol/sdk": "^1.25.2"
+	},
+	"peerDependencies": {
+		"@mariozechner/pi-agent-core": "*",
+		"@mariozechner/pi-ai": "*",
+		"@mariozechner/pi-coding-agent": "*",
+		"@sinclair/typebox": "*"
+	}
+}
