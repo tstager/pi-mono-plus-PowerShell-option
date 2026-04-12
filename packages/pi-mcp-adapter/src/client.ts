@@ -1,13 +1,25 @@
+import { UnauthorizedError } from "@modelcontextprotocol/sdk/client/auth.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import type { McpServerConfig } from "./config.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { type HttpMcpServerConfig, isStdioMcpServerConfig, type McpServerConfig } from "./config.js";
+import {
+	getGitHubCopilotMcpLoginRequiredMessage,
+	isGitHubCopilotMcpUrl,
+	loadGitHubCopilotMcpBearerToken,
+} from "./github-copilot-mcp-auth.js";
+import {
+	createFileBackedOAuthClientProvider,
+	type FileBackedOAuthClientProvider,
+	type FileBackedOAuthProviderRuntimeState,
+} from "./oauth-provider.js";
 import { buildRegisteredToolName, shouldExposeTool } from "./schema.js";
 
 const CLIENT_NAME = "pi-mcp-adapter";
 const CLIENT_VERSION = "0.1.0";
 
 type McpClient = Client;
-type McpTransport = StdioClientTransport;
+type McpTransport = StdioClientTransport | StreamableHTTPClientTransport;
 type McpListToolsResult = Awaited<ReturnType<McpClient["listTools"]>>;
 type McpRemoteTool = McpListToolsResult["tools"][number];
 export type McpCallToolResult = Awaited<ReturnType<McpClient["callTool"]>>;
@@ -20,14 +32,34 @@ export interface McpToolBinding {
 	inputSchema: unknown;
 }
 
+export interface McpServerTransportMetadata {
+	target: string;
+	sessionId?: string;
+}
+
+export type McpServerConnectionStatus = "connected" | "auth_required" | "error";
+
+export type McpServerOAuthMetadata = FileBackedOAuthProviderRuntimeState;
+
+export interface McpServerManagedAuthMetadata {
+	kind: "pi";
+	provider: "github-copilot";
+	status: "available" | "missing";
+}
+
 export interface McpServerConnection {
 	name: string;
-	status: "connected" | "error";
+	status: McpServerConnectionStatus;
+	transportKind: McpServerConfig["transport"];
+	transportMetadata: McpServerTransportMetadata;
 	description?: string;
 	configPath: string;
 	scope: "user" | "project";
 	toolCount: number;
 	errorMessage?: string;
+	oauth?: McpServerOAuthMetadata;
+	managedAuth?: McpServerManagedAuthMetadata;
+	serverConfig?: McpServerConfig;
 	client?: McpClient;
 	transport?: McpTransport;
 }
@@ -83,6 +115,165 @@ function getToolDescription(serverName: string, tool: McpRemoteTool): string {
 	return `Call MCP tool "${tool.name}" from server "${serverName}".`;
 }
 
+function getTransportTarget(serverConfig: McpServerConfig): string {
+	return isStdioMcpServerConfig(serverConfig) ? serverConfig.command : serverConfig.url;
+}
+
+function createTransportMetadata(serverConfig: McpServerConfig, transport?: McpTransport): McpServerTransportMetadata {
+	return {
+		target: getTransportTarget(serverConfig),
+		sessionId: transport instanceof StreamableHTTPClientTransport ? transport.sessionId : undefined,
+	};
+}
+
+function isStreamableHttpTransport(transport: McpTransport): transport is StreamableHTTPClientTransport {
+	return transport instanceof StreamableHTTPClientTransport;
+}
+
+function isOAuthHttpServerConfig(
+	serverConfig: McpServerConfig,
+): serverConfig is HttpMcpServerConfig & { oauth: NonNullable<HttpMcpServerConfig["oauth"]> } {
+	return !isStdioMcpServerConfig(serverConfig) && serverConfig.oauth !== undefined;
+}
+
+function hasHeaderCaseInsensitive(headers: Record<string, string> | undefined, headerName: string): boolean {
+	if (!headers) {
+		return false;
+	}
+
+	const normalizedHeaderName = headerName.toLowerCase();
+	return Object.keys(headers).some((key) => key.toLowerCase() === normalizedHeaderName);
+}
+
+function resolveManagedHttpHeaders(serverConfig: HttpMcpServerConfig): {
+	headers?: Record<string, string>;
+	missingAuthorizationMessage?: string;
+	managedAuth?: McpServerManagedAuthMetadata;
+} {
+	const configuredHeaders = serverConfig.headers ? { ...serverConfig.headers } : undefined;
+	if (serverConfig.oauth || hasHeaderCaseInsensitive(configuredHeaders, "Authorization")) {
+		return { headers: configuredHeaders };
+	}
+	if (!isGitHubCopilotMcpUrl(serverConfig.url)) {
+		return { headers: configuredHeaders };
+	}
+
+	const bearerToken = loadGitHubCopilotMcpBearerToken();
+	if (!bearerToken) {
+		return {
+			headers: configuredHeaders,
+			missingAuthorizationMessage: getGitHubCopilotMcpLoginRequiredMessage(serverConfig.name),
+			managedAuth: {
+				kind: "pi",
+				provider: "github-copilot",
+				status: "missing",
+			},
+		};
+	}
+
+	return {
+		headers: {
+			...(configuredHeaders ?? {}),
+			Authorization: `Bearer ${bearerToken}`,
+		},
+		managedAuth: {
+			kind: "pi",
+			provider: "github-copilot",
+			status: "available",
+		},
+	};
+}
+
+function createTransport(
+	serverConfig: McpServerConfig,
+	authProvider?: FileBackedOAuthClientProvider,
+	requestHeaders?: Record<string, string>,
+): McpTransport {
+	if (isStdioMcpServerConfig(serverConfig)) {
+		return new StdioClientTransport({
+			command: serverConfig.command,
+			args: serverConfig.args,
+			cwd: serverConfig.cwd,
+			env: serverConfig.env,
+		});
+	}
+
+	const requestInit: RequestInit | undefined = requestHeaders
+		? {
+				headers: requestHeaders,
+			}
+		: undefined;
+
+	return new StreamableHTTPClientTransport(new URL(serverConfig.url), {
+		authProvider,
+		requestInit,
+	});
+}
+
+function createErroredConnection(
+	serverName: string,
+	serverConfig: McpServerConfig,
+	errorMessage: string,
+): McpServerConnection {
+	return {
+		name: serverName,
+		status: "error",
+		transportKind: serverConfig.transport,
+		transportMetadata: createTransportMetadata(serverConfig),
+		description: serverConfig.description,
+		configPath: serverConfig.configPath,
+		scope: serverConfig.scope,
+		toolCount: 0,
+		errorMessage,
+		serverConfig,
+	};
+}
+
+function createManagedAuthRequiredConnection(
+	serverName: string,
+	serverConfig: HttpMcpServerConfig,
+	errorMessage: string,
+	managedAuth: McpServerManagedAuthMetadata,
+): McpServerConnection {
+	return {
+		name: serverName,
+		status: "auth_required",
+		transportKind: serverConfig.transport,
+		transportMetadata: createTransportMetadata(serverConfig),
+		description: serverConfig.description,
+		configPath: serverConfig.configPath,
+		scope: serverConfig.scope,
+		toolCount: 0,
+		errorMessage,
+		managedAuth,
+		serverConfig,
+	};
+}
+
+async function createAuthRequiredConnection(
+	serverName: string,
+	serverConfig: HttpMcpServerConfig & { oauth: NonNullable<HttpMcpServerConfig["oauth"]> },
+	oauthProvider: ReturnType<typeof createFileBackedOAuthClientProvider>,
+	client: McpClient,
+	transport: StreamableHTTPClientTransport,
+): Promise<McpServerConnection> {
+	return {
+		name: serverName,
+		status: "auth_required",
+		transportKind: serverConfig.transport,
+		transportMetadata: createTransportMetadata(serverConfig, transport),
+		description: serverConfig.description,
+		configPath: serverConfig.configPath,
+		scope: serverConfig.scope,
+		toolCount: 0,
+		errorMessage: `OAuth authorization is required for MCP server "${serverName}". Complete the pending OAuth flow, then retry the connection.`,
+		oauth: await oauthProvider.getRuntimeState(),
+		serverConfig,
+		client,
+		transport,
+	};
+}
+
 async function connectServer(
 	serverName: string,
 	serverConfig: McpServerConfig,
@@ -90,18 +281,35 @@ async function connectServer(
 	previousBindingsByKey: ReadonlyMap<string, McpToolBinding>,
 	reservedNames: ReadonlySet<string>,
 ): Promise<{ connection: McpServerConnection; bindings: McpToolBinding[] }> {
-	try {
-		const transport = new StdioClientTransport({
-			command: serverConfig.command,
-			args: serverConfig.args,
-			cwd: serverConfig.cwd,
-			env: serverConfig.env,
-		});
-		const client = new Client({
-			name: CLIENT_NAME,
-			version: CLIENT_VERSION,
-		});
+	const oauthProvider = isOAuthHttpServerConfig(serverConfig)
+		? createFileBackedOAuthClientProvider(serverConfig.oauth)
+		: undefined;
+	const managedHttpHeaders = !isStdioMcpServerConfig(serverConfig)
+		? resolveManagedHttpHeaders(serverConfig)
+		: undefined;
+	if (!isStdioMcpServerConfig(serverConfig) && managedHttpHeaders?.missingAuthorizationMessage) {
+		return {
+			connection: createManagedAuthRequiredConnection(
+				serverName,
+				serverConfig,
+				managedHttpHeaders.missingAuthorizationMessage,
+				managedHttpHeaders.managedAuth ?? {
+					kind: "pi",
+					provider: "github-copilot",
+					status: "missing",
+				},
+			),
+			bindings: [],
+		};
+	}
 
+	const transport = createTransport(serverConfig, oauthProvider, managedHttpHeaders?.headers);
+	const client = new Client({
+		name: CLIENT_NAME,
+		version: CLIENT_VERSION,
+	});
+
+	try {
 		await client.connect(transport);
 		const toolsResult = await client.listTools();
 		const bindings: McpToolBinding[] = [];
@@ -132,27 +340,57 @@ async function connectServer(
 			connection: {
 				name: serverName,
 				status: "connected",
+				transportKind: serverConfig.transport,
+				transportMetadata: createTransportMetadata(serverConfig, transport),
 				description: serverConfig.description,
 				configPath: serverConfig.configPath,
 				scope: serverConfig.scope,
 				toolCount: bindings.length,
+				oauth: oauthProvider ? await oauthProvider.getRuntimeState() : undefined,
+				managedAuth: managedHttpHeaders?.managedAuth,
+				serverConfig,
 				client,
 				transport,
 			},
 			bindings,
 		};
 	} catch (error) {
+		if (
+			oauthProvider &&
+			isOAuthHttpServerConfig(serverConfig) &&
+			isStreamableHttpTransport(transport) &&
+			error instanceof UnauthorizedError
+		) {
+			return {
+				connection: await createAuthRequiredConnection(serverName, serverConfig, oauthProvider, client, transport),
+				bindings: [],
+			};
+		}
+
+		if (
+			!isStdioMcpServerConfig(serverConfig) &&
+			!serverConfig.oauth &&
+			isGitHubCopilotMcpUrl(serverConfig.url) &&
+			error instanceof UnauthorizedError
+		) {
+			return {
+				connection: createManagedAuthRequiredConnection(
+					serverName,
+					serverConfig,
+					getGitHubCopilotMcpLoginRequiredMessage(serverName),
+					{
+						kind: "pi",
+						provider: "github-copilot",
+						status: "missing",
+					},
+				),
+				bindings: [],
+			};
+		}
+
 		const message = error instanceof Error ? error.message : String(error);
 		return {
-			connection: {
-				name: serverName,
-				status: "error",
-				description: serverConfig.description,
-				configPath: serverConfig.configPath,
-				scope: serverConfig.scope,
-				toolCount: 0,
-				errorMessage: message,
-			},
+			connection: createErroredConnection(serverName, serverConfig, message),
 			bindings: [],
 		};
 	}
@@ -236,6 +474,37 @@ export async function reconnectServers(
 	};
 }
 
+export async function finishServerAuthorization(
+	state: McpRuntimeState,
+	serverName: string,
+	authorizationCode: string,
+): Promise<McpServerOAuthMetadata> {
+	const server = state.servers.get(serverName);
+	if (!server || !server.serverConfig || isStdioMcpServerConfig(server.serverConfig) || !server.serverConfig.oauth) {
+		throw new Error(`MCP server "${serverName}" does not have a pending OAuth authorization flow.`);
+	}
+
+	const transport =
+		server.transport && isStreamableHttpTransport(server.transport)
+			? server.transport
+			: createTransport(server.serverConfig, createFileBackedOAuthClientProvider(server.serverConfig.oauth));
+	if (!isStreamableHttpTransport(transport)) {
+		throw new Error(`MCP server "${serverName}" does not support finishing OAuth on its current transport.`);
+	}
+
+	await transport.finishAuth(authorizationCode);
+
+	const oauthProvider = createFileBackedOAuthClientProvider(server.serverConfig.oauth);
+	const oauth = await oauthProvider.getRuntimeState();
+	state.servers.set(serverName, {
+		...server,
+		errorMessage: undefined,
+		oauth,
+		transport,
+	});
+	return oauth;
+}
+
 export async function callBoundTool(
 	state: McpRuntimeState,
 	registeredName: string,
@@ -247,9 +516,19 @@ export async function callBoundTool(
 	}
 
 	const server = state.servers.get(binding.serverName);
-	if (!server || server.status !== "connected" || !server.client) {
+	if (!server) {
 		throw new Error(
-			`MCP server "${binding.serverName}" is not currently connected. Run /mcp-reload or /reload to refresh it.`,
+			`MCP server "${binding.serverName}" is not currently connected. Run /reload to fully unregister removed tools, or /mcp-reload if the server config still exists.`,
+		);
+	}
+	if (server.status === "auth_required") {
+		throw new Error(
+			`MCP server "${binding.serverName}" requires OAuth authorization. Complete the pending OAuth flow, then retry the tool call.`,
+		);
+	}
+	if (server.status !== "connected" || !server.client) {
+		throw new Error(
+			`MCP server "${binding.serverName}" is not currently connected. Run /reload to fully unregister removed tools, or /mcp-reload if the server config still exists.`,
 		);
 	}
 

@@ -88,17 +88,28 @@ const claudeCodeTools = [
 ];
 
 const ccToolLookup = new Map(claudeCodeTools.map((t) => [t.toLowerCase(), t]));
+const claudeCodeToolAliases = new Map<string, string>([
+	["ask_user", "AskUserQuestion"],
+	["todo_write", "TodoWrite"],
+	["web_fetch", "WebFetch"],
+	["web_search", "WebSearch"],
+]);
 
 // Convert tool name to CC canonical casing if it matches (case-insensitive)
-const toClaudeCodeName = (name: string) => ccToolLookup.get(name.toLowerCase()) ?? name;
+const toClaudeCodeName = (name: string) =>
+	claudeCodeToolAliases.get(name.toLowerCase()) ?? ccToolLookup.get(name.toLowerCase()) ?? name;
 const fromClaudeCodeName = (name: string, tools?: Tool[]) => {
 	if (tools && tools.length > 0) {
 		const lowerName = name.toLowerCase();
-		const matchedTool = tools.find((tool) => tool.name.toLowerCase() === lowerName);
+		const matchedTool = tools.find((tool) => toClaudeCodeName(tool.name).toLowerCase() === lowerName);
 		if (matchedTool) return matchedTool.name;
 	}
 	return name;
 };
+
+function usesClaudeCodeToolCompatibility(model: Model<"anthropic-messages">, isOAuthToken: boolean): boolean {
+	return isOAuthToken || model.provider === "github-copilot";
+}
 
 /**
  * Convert content blocks to Anthropic API format
@@ -307,7 +318,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 						const block: Block = {
 							type: "toolCall",
 							id: event.content_block.id,
-							name: isOAuth
+							name: usesClaudeCodeToolCompatibility(model, isOAuth)
 								? fromClaudeCodeName(event.content_block.name, context.tools)
 								: event.content_block.name,
 							arguments: (event.content_block.input as Record<string, any>) ?? {},
@@ -651,7 +662,7 @@ function buildParams(
 	}
 
 	if (context.tools) {
-		params.tools = convertTools(context.tools, isOAuthToken);
+		params.tools = convertTools(context.tools, usesClaudeCodeToolCompatibility(model, isOAuthToken));
 	}
 
 	// Configure thinking mode: adaptive (Opus 4.6 and Sonnet 4.6),
@@ -791,7 +802,9 @@ function convertMessages(
 					blocks.push({
 						type: "tool_use",
 						id: block.id,
-						name: isOAuthToken ? toClaudeCodeName(block.name) : block.name,
+						name: usesClaudeCodeToolCompatibility(model, isOAuthToken)
+							? toClaudeCodeName(block.name)
+							: block.name,
 						input: block.arguments ?? {},
 					});
 				}
@@ -868,15 +881,23 @@ function convertTools(tools: Tool[], isOAuthToken: boolean): Anthropic.Messages.
 	if (!tools) return [];
 
 	return tools.map((tool) => {
-		const jsonSchema = tool.parameters as any; // TypeBox already generates JSON Schema
+		const jsonSchema = (tool.parameters as Record<string, unknown> | undefined) ?? {};
+		const properties =
+			typeof jsonSchema.properties === "object" &&
+			jsonSchema.properties !== null &&
+			!Array.isArray(jsonSchema.properties)
+				? jsonSchema.properties
+				: {};
+		const required = Array.isArray(jsonSchema.required) ? jsonSchema.required : [];
 
 		return {
 			name: isOAuthToken ? toClaudeCodeName(tool.name) : tool.name,
 			description: tool.description,
 			input_schema: {
+				...jsonSchema,
 				type: "object" as const,
-				properties: jsonSchema.properties || {},
-				required: jsonSchema.required || [],
+				properties,
+				required,
 			},
 		};
 	});

@@ -75,14 +75,80 @@ describe("pi-mcp-adapter helpers", () => {
 			);
 
 			const config = loadMcpConfig(projectDir);
-			const commandsByScope = new Map(config.servers.map((server) => [`${server.scope}:${server.command}`, server]));
+			const sharedServer = config.servers.find((server) => server.name === "shared");
+			const userOnlyServer = config.servers.find((server) => server.name === "userOnly");
+			const projectOnlyServer = config.servers.find((server) => server.name === "projectOnly");
 
 			expect(config.configPaths).toEqual([userConfigPath, projectConfigPath]);
 			expect(config.servers).toHaveLength(3);
-			expect(commandsByScope.has("project:python")).toBe(true);
-			expect(config.servers.find((server) => server.command === "python" && server.scope === "project")?.cwd).toBe(
-				path.resolve(projectDir, ".pi", "..\\tools"),
+			expect(config.servers.every((server) => server.transport === "stdio")).toBe(true);
+			expect(sharedServer?.scope).toBe("project");
+			expect(projectOnlyServer?.scope).toBe("project");
+			expect(userOnlyServer?.scope).toBe("user");
+
+			if (!sharedServer || sharedServer.transport !== "stdio") {
+				throw new Error("Expected merged shared server to remain a stdio config.");
+			}
+
+			expect(sharedServer.command).toBe("python");
+			expect(sharedServer.cwd).toBe(path.resolve(projectDir, ".pi", "..\\tools"));
+		} finally {
+			if (previousHome === undefined) {
+				delete process.env.HOME;
+			} else {
+				process.env.HOME = previousHome;
+			}
+		}
+	});
+
+	it("parses explicit http transport entries for both http and https URLs", () => {
+		const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-mcp-http-home-"));
+		const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-mcp-http-project-"));
+		tempDirs.push(homeDir, projectDir);
+
+		const previousHome = process.env.HOME;
+		process.env.HOME = homeDir;
+
+		try {
+			const projectConfigPath = path.join(projectDir, ".pi", "mcp.json");
+			fs.mkdirSync(path.dirname(projectConfigPath), { recursive: true });
+			fs.writeFileSync(
+				projectConfigPath,
+				JSON.stringify({
+					mcpServers: {
+						localHttp: {
+							transport: "http",
+							url: "http://127.0.0.1:8080/mcp",
+						},
+						remoteHttps: {
+							transport: "http",
+							url: "https://example.com/mcp",
+							headers: {
+								Authorization: "Bearer test-token",
+							},
+						},
+					},
+				}),
 			);
+
+			const config = loadMcpConfig(projectDir);
+			const localHttp = config.servers.find((server) => server.name === "localHttp");
+			const remoteHttps = config.servers.find((server) => server.name === "remoteHttps");
+
+			expect(config.configPaths).toEqual([projectConfigPath]);
+
+			if (!localHttp || localHttp.transport !== "http") {
+				throw new Error("Expected localHttp to parse as an explicit http transport config.");
+			}
+			if (!remoteHttps || remoteHttps.transport !== "http") {
+				throw new Error("Expected remoteHttps to parse as an explicit http transport config.");
+			}
+
+			expect(localHttp.url).toBe("http://127.0.0.1:8080/mcp");
+			expect(remoteHttps.url).toBe("https://example.com/mcp");
+			expect(remoteHttps.headers).toEqual({
+				Authorization: "Bearer test-token",
+			});
 		} finally {
 			if (previousHome === undefined) {
 				delete process.env.HOME;
@@ -100,6 +166,7 @@ describe("pi-mcp-adapter helpers", () => {
 			shouldExposeTool(
 				{
 					name: "docs",
+					transport: "stdio",
 					command: "node",
 					args: [],
 					enabled: true,
@@ -115,6 +182,7 @@ describe("pi-mcp-adapter helpers", () => {
 			shouldExposeTool(
 				{
 					name: "docs",
+					transport: "stdio",
 					command: "node",
 					args: [],
 					enabled: true,
