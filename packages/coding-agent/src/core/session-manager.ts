@@ -781,6 +781,23 @@ export class SessionManager {
 		return this.cwd;
 	}
 
+	setCwd(cwd: string): void {
+		if (this.cwd === cwd) {
+			return;
+		}
+
+		this.cwd = cwd;
+		const header = this.getHeader();
+		if (header) {
+			header.cwd = cwd;
+		}
+
+		if (this.sessionFile && existsSync(this.sessionFile)) {
+			this._rewriteFile();
+			this.flushed = true;
+		}
+	}
+
 	getSessionDir(): string {
 		return this.sessionDir;
 	}

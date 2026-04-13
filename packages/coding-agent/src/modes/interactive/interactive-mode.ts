@@ -4663,6 +4663,10 @@ export class InteractiveMode {
 			return;
 		}
 
+		if (await this.handleChangeDirectoryCommand(command, excludeFromContext)) {
+			return;
+		}
+
 		// Normal execution path (possibly with custom operations)
 		const isDeferred = this.session.isStreaming;
 		this.bashComponent = new BashExecutionComponent(command, this.ui, excludeFromContext);
@@ -4706,6 +4710,98 @@ export class InteractiveMode {
 
 		this.bashComponent = undefined;
 		this.ui.requestRender();
+	}
+
+	private resolveStandaloneCdTarget(command: string): string | undefined {
+		const match = /^\s*cd(?:\s+(.+))?\s*$/.exec(command);
+		if (!match) {
+			return undefined;
+		}
+
+		let target = match[1]?.trim();
+		if (!target || target === "~") {
+			return os.homedir();
+		}
+
+		if ((target.startsWith('"') && target.endsWith('"')) || (target.startsWith("'") && target.endsWith("'"))) {
+			target = target.slice(1, -1);
+		}
+
+		if (target.startsWith("~/") || target.startsWith("~\\")) {
+			target = path.join(os.homedir(), target.slice(2));
+		}
+
+		const resolved = path.resolve(this.sessionManager.getCwd(), target);
+		if (!fs.existsSync(resolved)) {
+			throw new Error(`Directory not found: ${resolved}`);
+		}
+
+		const stat = fs.statSync(resolved);
+		if (!stat.isDirectory()) {
+			throw new Error(`Not a directory: ${resolved}`);
+		}
+
+		return fs.realpathSync(resolved);
+	}
+
+	private async handleChangeDirectoryCommand(command: string, excludeFromContext: boolean): Promise<boolean> {
+		let nextCwd: string | undefined;
+		try {
+			nextCwd = this.resolveStandaloneCdTarget(command);
+		} catch (error) {
+			this.bashComponent = new BashExecutionComponent(command, this.ui, excludeFromContext);
+			if (this.session.isStreaming) {
+				this.pendingMessagesContainer.addChild(this.bashComponent);
+				this.pendingBashComponents.push(this.bashComponent);
+			} else {
+				this.chatContainer.addChild(this.bashComponent);
+			}
+			this.bashComponent.setComplete(undefined, false);
+			this.bashComponent = undefined;
+			this.showError(`Bash command failed: ${error instanceof Error ? error.message : "Unknown error"}`);
+			this.ui.requestRender();
+			return true;
+		}
+
+		if (!nextCwd) {
+			return false;
+		}
+
+		const isDeferred = this.session.isStreaming;
+		this.bashComponent = new BashExecutionComponent(command, this.ui, excludeFromContext);
+
+		if (isDeferred) {
+			this.pendingMessagesContainer.addChild(this.bashComponent);
+			this.pendingBashComponents.push(this.bashComponent);
+		} else {
+			this.chatContainer.addChild(this.bashComponent);
+		}
+		this.ui.requestRender();
+
+		try {
+			await this.runtimeHost.switchCwd(nextCwd);
+			await this.handleRuntimeSessionChange();
+			const result = {
+				output: `Changed directory to ${nextCwd}`,
+				exitCode: 0,
+				cancelled: false,
+				truncated: false,
+			};
+			if (this.bashComponent) {
+				this.bashComponent.appendOutput(result.output);
+				this.bashComponent.setComplete(result.exitCode, result.cancelled);
+			}
+			this.session.recordBashResult(command, result, { excludeFromContext });
+		} catch (error) {
+			if (this.bashComponent) {
+				this.bashComponent.setComplete(undefined, false);
+			}
+			this.showError(`Bash command failed: ${error instanceof Error ? error.message : "Unknown error"}`);
+		}
+
+		this.bashComponent = undefined;
+		this.ui.requestRender();
+		return true;
 	}
 
 	private async handleCompactCommand(customInstructions?: string): Promise<void> {

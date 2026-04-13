@@ -1,3 +1,4 @@
+import { fauxAssistantMessage } from "@mariozechner/pi-ai";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -204,5 +205,23 @@ describe("SessionManager.setSessionFile with corrupted files", () => {
 		const sm2 = SessionManager.open(corruptedFile, tempDir);
 		expect(sm2.getSessionId()).toBe(sessionId);
 		expect(sm2.getHeader()?.type).toBe("session");
+	});
+
+	it("updates the stored cwd in memory and on disk", () => {
+		const sessionDir = join(tempDir, "sessions");
+		mkdirSync(sessionDir, { recursive: true });
+		const sm = SessionManager.create(tempDir, sessionDir);
+		sm.appendMessage(fauxAssistantMessage("hello"));
+		const sessionFile = sm.getSessionFile();
+		expect(sessionFile).toBeTruthy();
+
+		const nextCwd = join(tempDir, "next");
+		mkdirSync(nextCwd, { recursive: true });
+		sm.setCwd(nextCwd);
+
+		expect(sm.getCwd()).toBe(nextCwd);
+		expect(sm.getHeader()?.cwd).toBe(nextCwd);
+		const reopened = SessionManager.open(sessionFile!, sessionDir);
+		expect(reopened.getCwd()).toBe(nextCwd);
 	});
 });

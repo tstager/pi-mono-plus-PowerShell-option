@@ -25,10 +25,10 @@ describe("AgentSessionRuntime characterization", () => {
 	const cleanups: Array<() => Promise<void> | void> = [];
 
 	afterEach(async () => {
+		process.chdir(tmpdir());
 		while (cleanups.length > 0) {
 			await cleanups.pop()?.();
 		}
-		process.chdir(tmpdir());
 	});
 
 	async function createRuntimeForTest(
@@ -303,6 +303,36 @@ describe("AgentSessionRuntime characterization", () => {
 
 		expect(realpathSync(process.cwd())).toBe(realpathSync(secondDir));
 		expect(realpathSync(runtime.session.sessionManager.getCwd())).toBe(realpathSync(secondDir));
+	});
+
+	it("rebuilds the runtime when switching cwd within the same session", async () => {
+		const events: RecordedSessionEvent[] = [];
+		const firstDir = join(tmpdir(), `pi-runtime-switch-a-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const secondDir = join(tmpdir(), `pi-runtime-switch-b-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(firstDir, { recursive: true });
+		mkdirSync(secondDir, { recursive: true });
+		const { runtime } = await createRuntimeForTest(
+			(pi: ExtensionAPI) => {
+				pi.on("session_start", (event) => {
+					events.push(event);
+				});
+			},
+			{ cwd: firstDir },
+		);
+
+		await runtime.session.prompt("hello");
+		events.length = 0;
+		const originalSessionFile = runtime.session.sessionFile;
+		const originalSession = runtime.session;
+
+		await runtime.switchCwd(secondDir);
+		await runtime.session.bindExtensions({});
+
+		expect(runtime.session).not.toBe(originalSession);
+		expect(runtime.session.sessionFile).toBe(originalSessionFile);
+		expect(realpathSync(process.cwd())).toBe(realpathSync(secondDir));
+		expect(realpathSync(runtime.session.sessionManager.getCwd())).toBe(realpathSync(secondDir));
+		expect(events).toEqual([{ type: "session_start", reason: "reload" }]);
 	});
 
 	it("restores model and thinking state from the destination session", async () => {

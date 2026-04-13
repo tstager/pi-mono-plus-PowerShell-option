@@ -146,6 +146,20 @@ export class AgentSessionRuntime {
 		return { cancelled: false };
 	}
 
+	async switchCwd(cwd: string): Promise<void> {
+		const sessionManager = this.session.sessionManager;
+		sessionManager.setCwd(cwd);
+		await this.teardownCurrent();
+		this.apply(
+			await this.createRuntime({
+				cwd,
+				agentDir: this.services.agentDir,
+				sessionManager,
+				sessionStartEvent: { type: "session_start", reason: "reload" },
+			}),
+		);
+	}
+
 	async newSession(options?: {
 		parentSession?: string;
 		setup?: (sessionManager: SessionManager) => Promise<void>;
